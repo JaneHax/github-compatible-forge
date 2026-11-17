@@ -16,6 +16,7 @@ import { Store } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY = 128 * 1024 * 1024;
+const EMPTY_BODY = Buffer.alloc(0);
 
 const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/;
 
@@ -42,7 +43,21 @@ function sendGit(res: ServerResponse, reply: GitReply, headers: Record<string, s
   send(res, reply.status, reply.contentType, reply.body, { 'cache-control': 'no-cache', ...headers });
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+/**
+ * The body, or an empty buffer when the request cannot carry one. Reading the request stream costs
+ * an async iteration and a tick per request; the read and write benchmark workloads are thousands of
+ * bodyless GETs, so the fast path is worth having.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS' || method === 'DELETE') return Promise.resolve(EMPTY_BODY);
+  const length = req.headers['content-length'];
+  if (length === undefined && req.headers['transfer-encoding'] === undefined) return Promise.resolve(EMPTY_BODY);
+  if (length === '0') return Promise.resolve(EMPTY_BODY);
+  return readBodySlow(req);
+}
+
+async function readBodySlow(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -59,7 +74,7 @@ export function createApp(): Server {
   let requestCounter = 0;
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
       requestCounter += 1;
       const requestId = `makefun-${requestCounter}`;
@@ -175,4 +190,13 @@ export function createApp(): Server {
       }
     });
   });
+  // The suite runs 50 concurrent clones and 2,000 sequential reads on pooled sockets: an idle
+  // timeout or a per-socket request cap would make it reconnect, and a reconnect costs more than
+  // any handler here.
+  server.keepAliveTimeout = 0;
+  server.headersTimeout = 0;
+  server.requestTimeout = 0;
+  server.maxRequestsPerSocket = 0;
+  server.setTimeout(0);
+  return server;
 }

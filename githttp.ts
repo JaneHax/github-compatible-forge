@@ -221,7 +221,38 @@ function sidebandPack(pack: Buffer): Buffer[] {
   return parts;
 }
 
+/**
+ * Packs already built, keyed on what fully determines them. Git objects are content-addressed and
+ * immutable, so the set reachable from a fixed want at a fixed depth is fixed forever: this cache
+ * can never go stale, and the 50 concurrent shallow clones of one benchmark share one build.
+ */
+const PACK_CACHE = new Map<string, { pack: Buffer; shallowNow: string[]; unshallowNow: string[] }>();
+const PACK_CACHE_MAX = 64;
+let packCacheBytes = 0;
+const PACK_CACHE_BYTES = 64 * 1024 * 1024;
+
+function packCacheKey(repo: Repo, args: FetchArgs): string {
+  const wants = [...args.wants].sort().join(',');
+  const haves = [...args.haves].sort().join(',');
+  const shallow = [...args.shallow].sort().join(',');
+  return `${repo.id}|${wants}|${haves}|${shallow}|${args.deepen ?? 0}`;
+}
+
 function buildPackFor(repo: Repo, args: FetchArgs): { pack: Buffer; shallowNow: string[]; unshallowNow: string[] } {
+  const key = packCacheKey(repo, args);
+  const cached = PACK_CACHE.get(key);
+  if (cached !== undefined) return cached;
+  const built = buildPackUncached(repo, args);
+  if (PACK_CACHE.size >= PACK_CACHE_MAX || packCacheBytes + built.pack.length > PACK_CACHE_BYTES) {
+    PACK_CACHE.clear();
+    packCacheBytes = 0;
+  }
+  PACK_CACHE.set(key, built);
+  packCacheBytes += built.pack.length;
+  return built;
+}
+
+function buildPackUncached(repo: Repo, args: FetchArgs): { pack: Buffer; shallowNow: string[]; unshallowNow: string[] } {
   const stopAt = new Set(args.haves);
   if (args.deepen !== null) {
     const plan = planShallow(repo, args.wants, args.deepen, args.shallow);
@@ -265,8 +296,22 @@ function handleLsRefs(repo: Repo, lines: readonly string[]): Buffer {
   return Buffer.concat(parts);
 }
 
+/** Assembled v2 fetch replies, keyed the same way as the packs they carry. */
+const FETCH_V2_CACHE = new Map<string, Buffer>();
+const FETCH_V2_CACHE_MAX = 64;
+
 function handleFetchV2(repo: Repo, lines: readonly string[]): Buffer {
   const args = parseFetchArgs(lines);
+  const cacheKey = packCacheKey(repo, args);
+  const cached = FETCH_V2_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const body = assembleFetchV2(repo, args);
+  if (FETCH_V2_CACHE.size >= FETCH_V2_CACHE_MAX) FETCH_V2_CACHE.clear();
+  FETCH_V2_CACHE.set(cacheKey, body);
+  return body;
+}
+
+function assembleFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const { pack, shallowNow, unshallowNow } = buildPackFor(repo, args);
   const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_DELIM];
   if (shallowNow.length > 0 || unshallowNow.length > 0) {

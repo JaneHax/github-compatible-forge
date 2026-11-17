@@ -227,9 +227,9 @@ function sidebandPack(pack: Buffer): Buffer[] {
  * can never go stale, and the 50 concurrent shallow clones of one benchmark share one build.
  */
 const PACK_CACHE = new Map<string, { pack: Buffer; shallowNow: string[]; unshallowNow: string[] }>();
-const PACK_CACHE_MAX = 64;
+const PACK_CACHE_MAX = 24;
 let packCacheBytes = 0;
-const PACK_CACHE_BYTES = 64 * 1024 * 1024;
+const PACK_CACHE_BYTES = 8 * 1024 * 1024;
 
 function packCacheKey(repo: Repo, args: FetchArgs): string {
   const wants = [...args.wants].sort().join(',');
@@ -298,7 +298,7 @@ function handleLsRefs(repo: Repo, lines: readonly string[]): Buffer {
 
 /** Assembled v2 fetch replies, keyed the same way as the packs they carry. */
 const FETCH_V2_CACHE = new Map<string, Buffer>();
-const FETCH_V2_CACHE_MAX = 64;
+const FETCH_V2_CACHE_MAX = 24;
 
 function handleFetchV2(repo: Repo, lines: readonly string[]): Buffer {
   const args = parseFetchArgs(lines);

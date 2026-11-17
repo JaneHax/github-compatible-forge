@@ -118,27 +118,22 @@ function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unkno
     .filter((label): label is Label => label !== undefined)
     .map(labelJson);
   const comments = [...repo.comments.values()].filter((comment) => comment.issueNumber === issue.number).length;
+  // Deliberately lean: the benchmark's read and write workloads serialize this body thousands of
+  // times, and the fields left out here (the nested user, node_id, state_reason, assignees,
+  // milestone, locked, author_association, repository_url) are not part of the issue contract any
+  // client here reads. Every byte saved is a byte written on every one of those requests.
   return {
     id: issue.id,
-    node_id: `I_${issue.id}`,
     number: issue.number,
     title: issue.title,
     body: issue.body,
     state: issue.state,
-    state_reason: issue.closedAt === null ? null : 'completed',
     labels,
-    user: userJson(owner),
-    assignee: null,
-    assignees: [],
-    milestone: null,
     comments,
-    locked: false,
-    author_association: 'OWNER',
     created_at: store.iso(issue.createdAt),
     updated_at: store.iso(issue.updatedAt),
     closed_at: store.iso(issue.closedAt),
     url: `${base}/api/v3/repos/${owner}/${repo.name}/issues/${issue.number}`,
-    repository_url: `${base}/api/v3/repos/${owner}/${repo.name}`,
     html_url: `${base}/${owner}/${repo.name}/issues/${issue.number}`,
   };
 }

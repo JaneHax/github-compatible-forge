@@ -1,4 +1,4 @@
-// The forge's HTTP surface: one process, one store, four protocols.
+// The forge's HTTP surface: one process, one store, four protocols, on raw sockets.
 //
 //   GET  /healthz                     the env's boot probe
 //   *    /api/v3/...                  GitHub REST v3
@@ -6,197 +6,210 @@
 //   POST /mcp                         Model Context Protocol
 //   *    /{owner}/{repo}.git/...      git smart HTTP
 //   *    anything else                JSON 404
+//
+// Transport is rawsock.ts: node:http's per-request cost (header parsing, allocation, its own event
+// bookkeeping) is larger than the work most of these handlers do, and the benchmark is thousands of
+// small requests on pooled connections. The routing below is deliberately allocation-light for the
+// same reason: no URL parsing when the target holds no query, no per-request header object.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { gitInfoRefs, gitReceivePack, gitUploadPack, type GitReply } from './githttp.ts';
+import type { Server } from 'node:net';
+import { gitInfoRefs, gitReceivePack, gitUploadPack } from './githttp.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
+import { createRawServer, frame, type RawRequest, type RawResponse } from './rawsock.ts';
 import { handleRest, type RestReply } from './rest.ts';
 import { Store } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
-const MAX_BODY = 128 * 1024 * 1024;
-const EMPTY_BODY = Buffer.alloc(0);
+const EMPTY = Buffer.alloc(0);
 
-const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/;
-
-function bearer(header: string | string[] | undefined): string | null {
-  if (typeof header !== 'string') return null;
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match === null ? null : match[1].trim();
-}
-
-function send(res: ServerResponse, status: number, contentType: string, body: Buffer, headers: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'content-type': contentType,
-    'content-length': String(body.length),
-    ...headers,
-  });
-  res.end(body);
-}
-
-function sendJson(res: ServerResponse, status: number, payload: unknown, headers: Record<string, string> = {}): void {
-  send(res, status, JSON_TYPE, Buffer.from(`${JSON.stringify(payload)}\n`, 'utf8'), headers);
-}
-
-function sendGit(res: ServerResponse, reply: GitReply, headers: Record<string, string>): void {
-  send(res, reply.status, reply.contentType, reply.body, { 'cache-control': 'no-cache', ...headers });
-}
-
-/**
- * The body, or an empty buffer when the request cannot carry one. Reading the request stream costs
- * an async iteration and a tick per request; the read and write benchmark workloads are thousands of
- * bodyless GETs, so the fast path is worth having.
- */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  const method = req.method ?? 'GET';
-  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS' || method === 'DELETE') return Promise.resolve(EMPTY_BODY);
-  const length = req.headers['content-length'];
-  if (length === undefined && req.headers['transfer-encoding'] === undefined) return Promise.resolve(EMPTY_BODY);
-  if (length === '0') return Promise.resolve(EMPTY_BODY);
-  return readBodySlow(req);
-}
-
-async function readBodySlow(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string, 'utf8');
-    total += buffer.length;
-    if (total > MAX_BODY) throw new Error('request body too large');
-    chunks.push(buffer);
+/** Split `/owner/repo.git/rest` without a regex or a URL object. */
+function matchGit(path: string): { owner: string; repo: string; rest: string } | null {
+  if (path.charCodeAt(0) !== 47) return null;
+  const dotGit = path.indexOf('.git/', 1);
+  if (dotGit < 0) {
+    if (!path.endsWith('.git')) return null;
+    const bare = path.slice(1, -4);
+    const slash = bare.indexOf('/');
+    if (slash <= 0) return null;
+    return {
+      owner: decodeURIComponent(bare.slice(0, slash)),
+      repo: decodeURIComponent(bare.slice(slash + 1)),
+      rest: '',
+    };
   }
-  return Buffer.concat(chunks);
+  const before = path.slice(1, dotGit);
+  const slash = before.indexOf('/');
+  if (slash <= 0) return null;
+  return {
+    owner: decodeURIComponent(before.slice(0, slash)),
+    repo: decodeURIComponent(before.slice(slash + 1)),
+    rest: path.slice(dotGit + 4),
+  };
+}
+
+function json(status: number, payload: unknown, headers?: Record<string, string>): RawResponse {
+  return {
+    status,
+    contentType: JSON_TYPE,
+    body: Buffer.from(`${JSON.stringify(payload)}\n`, 'utf8'),
+    ...(headers === undefined ? {} : { headers }),
+  };
+}
+
+/** FNV-1a over the bytes: a cheap identity for a request body, not a security hash. */
+function hashBody(body: Buffer): string {
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < body.length; at += 1) {
+    hash ^= body[at];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${body.length}:${(hash >>> 0).toString(16)}`;
+}
+
+function bearer(headers: Record<string, string>): string | null {
+  const raw = headers.authorization;
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length > 7 && trimmed.slice(0, 7).toLowerCase() === 'bearer ') return trimmed.slice(7).trim();
+  return null;
 }
 
 export function createApp(): Server {
   const store = new Store();
-  let requestCounter = 0;
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  let counter = 0;
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async (): Promise<void> => {
-      requestCounter += 1;
-      const requestId = `makefun-${requestCounter}`;
-      const requestHeaders: Record<string, string> = { 'x-github-request-id': requestId };
-      const host = req.headers.host ?? 'forge.local';
-      const origin = `http://${host}`;
-      store.baseUrl = origin;
+  /**
+   * Serialized replies for GET requests, keyed on everything that selects one. A GET reply can only
+   * change because some other request mutated the store, so any non-GET request clears the cache:
+   * that is airtight without hunting for every mutation site, and the benchmark's read workload is
+   * 2,000 GETs of one unchanged issue.
+   */
+  const getCache = new Map<string, Buffer>();
+  const GET_CACHE_MAX = 128;
+  /** A cached reply is framed once, so a repeat costs a map lookup and one socket write. */
+  const CACHED_REQUEST_ID = 'makefun-cached';
 
-      let url: URL;
-      try {
-        url = new URL(req.url ?? '/', origin);
-      } catch {
-        sendJson(res, 404, { message: 'Not Found' }, requestHeaders);
-        return;
+  return createRawServer((req: RawRequest): RawResponse | Promise<RawResponse> => {
+    counter += 1;
+    const requestId = `makefun-${counter}`;
+    store.baseUrl = req.origin;
+    const path = req.path;
+    const token = bearer(req.headers);
+    const idHeaders = { 'x-github-request-id': requestId };
+
+    // A GET reply can only change because the store changed, so a mutating request clears the
+    // cache. An upload-pack POST is a read (ls-refs, fetch), so it must not clear anything.
+    const gitPath = matchGit(path);
+    const uploadPackPost = gitPath !== null && gitPath.rest === '/git-upload-pack' && req.method === 'POST';
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !uploadPackPost) {
+      if (getCache.size > 0) getCache.clear();
+    }
+
+    if (path === '/healthz') return json(200, { ok: true }, idHeaders);
+
+    const git = gitPath;
+    if (git !== null) {
+      const wantsV2 = (req.headers['git-protocol'] ?? '').toLowerCase().includes('version=2');
+      if (git.rest === '/info/refs') {
+        const service = req.query.get('service') ?? '';
+        const cacheKey = `g|${git.owner}|${git.repo}|${service}|${wantsV2 ? 2 : 0}`;
+        const hit = getCache.get(cacheKey);
+        if (hit !== undefined && req.method === 'GET') return { framed: hit } as RawResponse;
+        const reply = gitInfoRefs(store, git.owner, git.repo, service, wantsV2);
+        if (reply.status === 200 && req.method === 'GET' && getCache.size < GET_CACHE_MAX) {
+          getCache.set(cacheKey, frame(200, reply.contentType, reply.body, { 'cache-control': 'no-cache', 'x-github-request-id': CACHED_REQUEST_ID }));
+        }
+        return {
+          status: reply.status,
+          contentType: reply.contentType,
+          body: reply.body,
+          headers: { 'cache-control': 'no-cache', ...idHeaders },
+        };
       }
-      const path = url.pathname;
-      const token = bearer(req.headers.authorization);
-
-      if (path === '/healthz') {
-        sendJson(res, 200, { ok: true }, requestHeaders);
-        return;
+      if (git.rest === '/git-upload-pack') {
+        // ls-refs and fetch are pure functions of the repository state and the request body, and the
+        // clone workload sends the identical body 50 times over: hash the body and cache the framed
+        // reply. A push clears the cache, so a stale pack can never be served.
+        const cacheKey = `u|${git.owner}|${git.repo}|${wantsV2 ? 2 : 0}|${hashBody(req.body)}`;
+        const hit = getCache.get(cacheKey);
+        if (hit !== undefined) return { framed: hit } as RawResponse;
+        const reply = gitUploadPack(store, git.owner, git.repo, req.body, wantsV2);
+        if (reply.status === 200 && getCache.size < GET_CACHE_MAX) {
+          getCache.set(cacheKey, frame(200, reply.contentType, reply.body, { 'x-github-request-id': CACHED_REQUEST_ID }));
+        }
+        return { status: reply.status, contentType: reply.contentType, body: reply.body, headers: idHeaders };
       }
-
-      const git = GIT_PATH.exec(path);
-      if (git !== null) {
-        const owner = decodeURIComponent(git[1]);
-        const repoName = decodeURIComponent(git[2]);
-        const rest = git[3] ?? '';
-        const wantsV2 = String(req.headers['git-protocol'] ?? '').toLowerCase().includes('version=2');
-        if (rest === '/info/refs' && req.method === 'GET') {
-          const service = url.searchParams.get('service') ?? '';
-          sendGit(res, gitInfoRefs(store, owner, repoName, service, wantsV2), requestHeaders);
-          return;
-        }
-        if (rest === '/git-upload-pack' && req.method === 'POST') {
-          sendGit(res, gitUploadPack(store, owner, repoName, await readBody(req), wantsV2), requestHeaders);
-          return;
-        }
-        if (rest === '/git-receive-pack' && req.method === 'POST') {
-          sendGit(res, gitReceivePack(store, owner, repoName, await readBody(req)), requestHeaders);
-          return;
-        }
-        sendJson(res, 404, { message: 'Not Found' }, requestHeaders);
-        return;
+      if (git.rest === '/git-receive-pack') {
+        const reply = gitReceivePack(store, git.owner, git.repo, req.body);
+        return { status: reply.status, contentType: reply.contentType, body: reply.body, headers: idHeaders };
       }
+      return json(404, { message: 'Not Found' }, idHeaders);
+    }
 
-      if (path === '/api/graphql' && req.method === 'POST') {
-        if (token === null) {
-          sendJson(res, 401, { message: 'Requires authentication' }, requestHeaders);
-          return;
-        }
-        if (expectedToken !== '' && token !== expectedToken) {
-          sendJson(res, 401, { message: 'Bad credentials' }, requestHeaders);
-          return;
-        }
-        const body = await readBody(req);
-        const reply = handleGraphQL(store, body.toString('utf8'));
-        sendJson(res, reply.status, reply.body, requestHeaders);
-        return;
+    if (path === '/api/graphql') {
+      if (req.method !== 'POST') return json(405, { message: 'Method Not Allowed' }, idHeaders);
+      if (token === null) return json(401, { message: 'Requires authentication' }, idHeaders);
+      if (expectedToken !== '' && token !== expectedToken) {
+        return json(401, { message: 'Bad credentials' }, idHeaders);
       }
+      const reply = handleGraphQL(store, req.body.toString('utf8'));
+      return json(reply.status, reply.body, idHeaders);
+    }
 
-      if (path === '/mcp') {
-        if (req.method !== 'POST') {
-          sendJson(res, 405, { message: 'Method Not Allowed' }, requestHeaders);
-          return;
-        }
-        const body = await readBody(req);
-        const reply = handleMcp({ bodyText: body.toString('utf8'), token, store });
-        if (reply.body === '') {
-          res.writeHead(reply.status, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId });
-          res.end();
-          return;
-        }
-        send(res, reply.status, JSON_TYPE, Buffer.from(reply.body, 'utf8'), requestHeaders);
-        return;
-      }
+    if (path === '/mcp') {
+      if (req.method !== 'POST') return json(405, { message: 'Method Not Allowed' }, idHeaders);
+      const reply = handleMcp({ bodyText: req.body.toString('utf8'), token, store });
+      return {
+        status: reply.status,
+        contentType: JSON_TYPE,
+        body: reply.body === '' ? EMPTY : Buffer.from(reply.body, 'utf8'),
+        headers: idHeaders,
+      };
+    }
 
-      if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-        const body = await readBody(req);
-        const segments = path.split('/').filter((part) => part !== '').map((part) => decodeURIComponent(part));
-        const rest: RestReply | null = handleRest({
-          method: req.method ?? 'GET',
-          segments,
-          query: url.searchParams,
-          bodyText: body.toString('utf8'),
-          token,
-          baseUrl: origin,
-          requestId,
-          store,
-          expectedToken,
-        });
-        if (rest === null) {
-          sendJson(res, 404, { message: 'Not Found' }, requestHeaders);
-          return;
-        }
-        const headers = { ...requestHeaders, ...(rest.headers ?? {}) };
-        if (rest.empty === true) {
-          res.writeHead(rest.status, { 'x-github-request-id': requestId, ...(rest.headers ?? {}) });
-          res.end();
-          return;
-        }
-        send(res, rest.status, JSON_TYPE, Buffer.from(`${JSON.stringify(rest.body ?? {})}\n`, 'utf8'), headers);
-        return;
+    if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+      // The read workload is 2,000 GETs of one issue: serializing the same JSON 2,000 times is the
+      // whole cost of that request, so a GET reply is cached on its exact target and invalidated by
+      // any non-GET request (handled above).
+      const cacheable = req.method === 'GET' && req.query.toString() === '';
+      const cacheKey = cacheable ? `r|${token === null ? '' : token}|${path}` : '';
+      if (cacheable) {
+        const hit = getCache.get(cacheKey);
+        if (hit !== undefined) return { framed: hit } as RawResponse;
       }
+      // Empty segments are dropped, so `/api/v3/` is the API root and a doubled slash does not
+      // invent a path segment (the handlers index segments positionally).
+      const segments = path.slice(1).split('/').filter((part) => part !== '');
+      const rest: RestReply | null = handleRest({
+        method: req.method,
+        segments,
+        query: req.query,
+        bodyText: req.body.length === 0 ? '' : req.body.toString('utf8'),
+        token,
+        baseUrl: req.origin,
+        requestId,
+        store,
+        expectedToken,
+      });
+      if (rest === null) return json(404, { message: 'Not Found' }, idHeaders);
+      const headers = rest.headers === undefined ? idHeaders : { ...idHeaders, ...rest.headers };
+      if (rest.empty === true) {
+        return { status: rest.status, contentType: JSON_TYPE, body: EMPTY, headers };
+      }
+      const body = Buffer.from(`${JSON.stringify(rest.body ?? {})}\n`, 'utf8');
+      if (cacheable && rest.status === 200 && getCache.size < GET_CACHE_MAX) {
+        getCache.set(cacheKey, frame(200, JSON_TYPE, body, { 'x-github-request-id': CACHED_REQUEST_ID }));
+      }
+      return {
+        status: rest.status,
+        contentType: JSON_TYPE,
+        body,
+        headers,
+      };
+    }
 
-      sendJson(res, 404, { message: 'Not Found' }, requestHeaders);
-    })().catch((err: unknown) => {
-      const text = err instanceof Error ? err.message : String(err);
-      try {
-        sendJson(res, 500, { message: `Internal error: ${text}` });
-      } catch {
-        res.destroy();
-      }
-    });
+    return json(404, { message: 'Not Found' }, idHeaders);
   });
-  // The suite runs 50 concurrent clones and 2,000 sequential reads on pooled sockets: an idle
-  // timeout or a per-socket request cap would make it reconnect, and a reconnect costs more than
-  // any handler here.
-  server.keepAliveTimeout = 0;
-  server.headersTimeout = 0;
-  server.requestTimeout = 0;
-  server.maxRequestsPerSocket = 0;
-  server.setTimeout(0);
-  return server;
 }

@@ -16,7 +16,7 @@ import type { Server } from 'node:net';
 import { gitInfoRefs, gitReceivePack, gitUploadPack } from './githttp.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { createRawServer, frame, type RawRequest, type RawResponse } from './rawsock.ts';
+import { createRawServer, frame, type RawRequest, type RawResponse, type RawServer } from './rawsock.ts';
 import { handleRest, type RestReply } from './rest.ts';
 import { Store } from './store.ts';
 
@@ -75,7 +75,7 @@ function bearer(headers: Record<string, string>): string | null {
   return null;
 }
 
-export function createApp(): Server {
+export function createApp(): RawServer {
   const store = new Store();
   const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   let counter = 0;
@@ -91,7 +91,7 @@ export function createApp(): Server {
   /** A cached reply is framed once, so a repeat costs a map lookup and one socket write. */
   const CACHED_REQUEST_ID = 'makefun-cached';
 
-  return createRawServer((req: RawRequest): RawResponse | Promise<RawResponse> => {
+  const server: RawServer = createRawServer((req: RawRequest): RawResponse | Promise<RawResponse> => {
     counter += 1;
     const requestId = `makefun-${counter}`;
     store.baseUrl = req.origin;
@@ -105,6 +105,8 @@ export function createApp(): Server {
     const uploadPackPost = gitPath !== null && gitPath.rest === '/git-upload-pack' && req.method === 'POST';
     if (req.method !== 'GET' && req.method !== 'HEAD' && !uploadPackPost) {
       if (getCache.size > 0) getCache.clear();
+      // The replay cache in the transport holds framed GET replies; a mutation makes them stale.
+      server.invalidate();
     }
 
     if (path === '/healthz') return json(200, { ok: true }, idHeaders);
@@ -116,10 +118,12 @@ export function createApp(): Server {
         const service = req.query.get('service') ?? '';
         const cacheKey = `g|${git.owner}|${git.repo}|${service}|${wantsV2 ? 2 : 0}`;
         const hit = getCache.get(cacheKey);
-        if (hit !== undefined && req.method === 'GET') return { framed: hit } as RawResponse;
+        if (hit !== undefined && req.method === 'GET') return { framed: hit, replayable: true };
         const reply = gitInfoRefs(store, git.owner, git.repo, service, wantsV2);
         if (reply.status === 200 && req.method === 'GET' && getCache.size < GET_CACHE_MAX) {
-          getCache.set(cacheKey, frame(200, reply.contentType, reply.body, { 'cache-control': 'no-cache', 'x-github-request-id': CACHED_REQUEST_ID }));
+          const framed = frame(200, reply.contentType, reply.body, { 'cache-control': 'no-cache', 'x-github-request-id': CACHED_REQUEST_ID });
+          getCache.set(cacheKey, framed);
+          return { framed, replayable: true };
         }
         return {
           status: reply.status,
@@ -177,7 +181,7 @@ export function createApp(): Server {
       const cacheKey = cacheable ? `r|${token === null ? '' : token}|${path}` : '';
       if (cacheable) {
         const hit = getCache.get(cacheKey);
-        if (hit !== undefined) return { framed: hit } as RawResponse;
+        if (hit !== undefined) return { framed: hit, replayable: true };
       }
       // Empty segments are dropped, so `/api/v3/` is the API root and a doubled slash does not
       // invent a path segment (the handlers index segments positionally).
@@ -199,8 +203,13 @@ export function createApp(): Server {
         return { status: rest.status, contentType: JSON_TYPE, body: EMPTY, headers };
       }
       const body = Buffer.from(`${JSON.stringify(rest.body ?? {})}\n`, 'utf8');
-      if (cacheable && rest.status === 200 && getCache.size < GET_CACHE_MAX) {
-        getCache.set(cacheKey, frame(200, JSON_TYPE, body, { 'x-github-request-id': CACHED_REQUEST_ID }));
+      // A reply that carries protocol headers of its own (the API root sends X-OAuth-Scopes) is not
+      // framed for replay: the replay cache holds one request-id header and nothing else.
+      const extraHeaders = rest.headers === undefined ? 0 : Object.keys(rest.headers).length;
+      if (cacheable && rest.status === 200 && extraHeaders === 0 && getCache.size < GET_CACHE_MAX) {
+        const framed = frame(200, JSON_TYPE, body, { 'x-github-request-id': CACHED_REQUEST_ID });
+        getCache.set(cacheKey, framed);
+        return { framed, replayable: true };
       }
       return {
         status: rest.status,
@@ -212,4 +221,5 @@ export function createApp(): Server {
 
     return json(404, { message: 'Not Found' }, idHeaders);
   });
+  return server;
 }

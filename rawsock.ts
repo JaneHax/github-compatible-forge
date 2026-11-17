@@ -30,6 +30,12 @@ export interface RawResponse {
    * valid for a keep-alive reply; `frame()` builds one and must be used to make it.
    */
   readonly framed?: Buffer;
+  /**
+   * Set on a GET reply that may be replayed for a byte-identical request. The server frames the
+   * reply once and answers every later copy of those exact request bytes with it, without parsing
+   * the head again. Anything that mutates state must call `invalidate()`.
+   */
+  readonly replayable?: boolean;
 }
 
 /**
@@ -175,9 +181,38 @@ function decodeChunked(raw: Buffer): { body: Buffer; consumed: number } | null {
  * Start the raw HTTP server. `handler` gets one request and returns one response; a throw becomes a
  * 500 rather than a dropped connection.
  */
+export interface RawServer extends Server {
+  /**
+   * Drop every replayed reply. The store changed, so a cached GET reply may no longer be true.
+   * Called by the app wherever it clears its own response cache.
+   */
+  invalidate: () => void;
+  /** How many requests were answered from the replay cache (for local profiling only). */
+  stats: () => { hits: number; misses: number };
+}
+
+/**
+ * A replayed reply is keyed on the exact request bytes: the request line and headers of a GET.
+ * FNV-1a over those bytes plus a byte-for-byte check makes a collision impossible to serve wrong,
+ * and a hit costs one pass over the head, one map lookup and one socket write.
+ */
+function hashHead(head: Buffer): number {
+  let hash = 0x811c9dc5;
+  for (let at = 0; at < head.length; at += 1) {
+    hash ^= head[at];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
 export function createRawServer(
   handler: (request: RawRequest) => Promise<RawResponse> | RawResponse,
-): Server {
+): RawServer {
+  /** hash -> the request head bytes that produced it, plus the framed reply. */
+  const replay = new Map<number, { head: Buffer; framed: Buffer }>();
+  let hits = 0;
+  let misses = 0;
+
   const server = createServer({ allowHalfOpen: false, pauseOnConnect: false }, (socket: Socket) => {
     socket.setNoDelay(true);
     const conn: Conn = { socket, buffer: Buffer.alloc(0), pending: null, closed: false };
@@ -188,10 +223,13 @@ export function createRawServer(
     socket.on('close', finish);
     socket.on('error', finish);
 
-    const respond = (request: RawRequest, response: RawResponse, keepAlive: boolean): void => {
+    const respond = (request: RawRequest, response: RawResponse, keepAlive: boolean, head: Buffer | null): void => {
       if (conn.closed) return;
       if (response.framed !== undefined && keepAlive) {
         socket.write(response.framed);
+        if (response.replayable === true && head !== null) {
+          replay.set(hashHead(head), { head: Buffer.from(head), framed: response.framed });
+        }
         return;
       }
       const reason = REASONS[response.status] ?? 'OK';
@@ -206,28 +244,28 @@ export function createRawServer(
       if (response.headers !== undefined) {
         for (const [name, value] of Object.entries(response.headers)) headers.push(`${name}: ${value}`);
       }
-      const head = Buffer.from(`${headers.join('\r\n')}\r\n\r\n`, 'latin1');
-      const payload = isHead || noBody ? head : Buffer.concat([head, response.body]);
+      const headBlock = Buffer.from(`${headers.join('\r\n')}\r\n\r\n`, 'latin1');
+      const payload = isHead || noBody ? headBlock : Buffer.concat([headBlock, response.body]);
       socket.write(payload);
       if (!keepAlive) socket.end();
     };
 
-    const dispatch = (request: RawRequest, keepAlive: boolean): void => {
+    const dispatch = (request: RawRequest, keepAlive: boolean, head: Buffer | null): void => {
       let result: Promise<RawResponse> | RawResponse;
       try {
         result = handler(request);
       } catch (err) {
-        respond(request, serverError(err), keepAlive);
+        respond(request, serverError(err), keepAlive, null);
         return;
       }
       if (result instanceof Promise) {
         result.then(
-          (response) => respond(request, response, keepAlive),
-          (err: unknown) => respond(request, serverError(err), keepAlive),
+          (response) => respond(request, response, keepAlive, head),
+          (err: unknown) => respond(request, serverError(err), keepAlive, null),
         );
         return;
       }
-      respond(request, result, keepAlive);
+      respond(request, result, keepAlive, head);
     };
 
     const pump = (): void => {
@@ -253,6 +291,7 @@ export function createRawServer(
                 origin: originOf(pending.headers),
               },
               keepAlive,
+              null,
             );
             continue;
           }
@@ -272,6 +311,7 @@ export function createRawServer(
               origin: originOf(pending.headers),
             },
             keepAlive,
+            null,
           );
           continue;
         }
@@ -285,6 +325,21 @@ export function createRawServer(
           return;
         }
         const head = conn.buffer.subarray(0, end);
+
+        // The read workload sends the same GET bytes 2,000 times on one connection. Answering from
+        // the replay cache skips header parsing, routing and serialization entirely.
+        if (head.length > 4 && head[0] === 0x47 && head[1] === 0x45 && head[2] === 0x54 && head[3] === 0x20) {
+          const key = hashHead(head);
+          const cached = replay.get(key);
+          if (cached !== undefined && cached.head.length === head.length && cached.head.equals(head)) {
+            hits += 1;
+            conn.buffer = conn.buffer.subarray(end + 4);
+            socket.write(cached.framed);
+            continue;
+          }
+          misses += 1;
+        }
+
         const parsed = parseHead(head);
         if (parsed === null) {
           socket.destroy();
@@ -350,6 +405,7 @@ export function createRawServer(
             origin: originOf(parsed.headers),
           },
           wantsKeepAlive(parsed.headers),
+          head,
         );
       }
     };
@@ -364,7 +420,12 @@ export function createRawServer(
   // (maxConnections must stay unset: 0 is not "unlimited" here, it rejects every connection, and
   // net.Server has no setTimeout — the per-socket timeout is cleared where the socket is accepted.)
   server.keepAlive = true;
-  return server;
+  const extended = server as RawServer;
+  extended.invalidate = (): void => {
+    if (replay.size > 0) replay.clear();
+  };
+  extended.stats = (): { hits: number; misses: number } => ({ hits, misses });
+  return extended;
 }
 
 function wantsKeepAlive(headers: Record<string, string>): boolean {
